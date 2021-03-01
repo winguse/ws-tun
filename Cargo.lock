@@ -131,15 +131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "etherparse"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fa20922281f9ee5ffcda45e80d56085829279f1270f79fbabc39809a4354807"
-dependencies = [
- "byteorder",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -970,7 +961,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "etherparse",
  "futures-util",
  "libc",
  "log",
