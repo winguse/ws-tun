@@ -1,6 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 
-use clap::*;
+use clap::{crate_description, crate_name, crate_version, value_t, App, Arg};
 use futures_util::stream::SplitSink;
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
@@ -27,10 +27,12 @@ struct ClientInfo {
     peer_addr: SocketAddr,
 }
 
-async fn ws_to_tun(
+async fn server_ws_to_tun(
     tun: Arc<TunSocket>,
     mut read: SplitStream<WebSocketStream<TcpStream>>,
+    client_ip: IpAddr,
     allowed_ips: AllowedIps<()>,
+    route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
 ) {
     loop {
         match read.next().await {
@@ -53,33 +55,6 @@ async fn ws_to_tun(
             Some(Err(_)) => break,
         }
     }
-}
-
-async fn tun_to_ws(tun: Arc<TunSocket>, mut write: SplitSink<WebSocketStream<TcpStream>, Message>) {
-    let mut buf = [0u8; MAX_PACKET_SIZE];
-    loop {
-        match tun.read(&mut buf) {
-            Ok(bin) => match write.send(Message::Binary(Vec::from(bin))).await {
-                Ok(_) => {}
-                Err(_) => {
-                    break;
-                }
-            },
-            Err(_) => {
-                break;
-            }
-        }
-    }
-}
-
-async fn server_ws_to_tun(
-    tun: Arc<TunSocket>,
-    read: SplitStream<WebSocketStream<TcpStream>>,
-    client_ip: IpAddr,
-    allowed_ips: AllowedIps<()>,
-    route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
-) {
-    ws_to_tun(tun, read, allowed_ips).await;
     match route_table.write().await.remove(&client_ip) {
         None => warn!("removing client error, the item doesn't exist"),
         Some(info) => info!("client {} terminated", info.peer_addr),
@@ -202,7 +177,7 @@ async fn main() {
         let (ws_stream, _) = connect_async(server_url)
             .await
             .expect("should connect to server success");
-        let (write, mut read) = ws_stream.split();
+        let (mut write, mut read) = ws_stream.split();
         match read.next().await {
             Some(Ok(Message::Text(init))) => {
                 let if_config: IfConfig = init
@@ -215,15 +190,49 @@ async fn main() {
                 return;
             }
         }
-        let mut allowed_ips: AllowedIps<()> = Default::default();
-        allowed_ips.insert("0.0.0.0/0".parse().unwrap(), 0, ());
-        allowed_ips.insert("0::/0".parse().unwrap(), 0, ());
-        tokio::spawn(ws_to_tun(
-            tun.clone(),
-            read,
-            allowed_ips, // accept any route
-        ));
-        tokio::spawn(tun_to_ws(tun.clone(), write));
+        let tun_read = tun.clone();
+        tokio::spawn(async move {
+            let mut allowed_ips: AllowedIps<()> = Default::default();
+            allowed_ips.insert("0.0.0.0/0".parse().unwrap(), 0, ());
+            allowed_ips.insert("0::/0".parse().unwrap(), 0, ());
+            loop {
+                match read.next().await {
+                    None => break,
+                    Some(Ok(Message::Text(_txt))) => {}
+                    Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
+                        Ok(addr) if allowed_ips.find(addr).is_some() => {
+                            if addr.is_ipv4() {
+                                tun.write4(&bin);
+                            } else {
+                                tun.write6(&bin);
+                            }
+                        }
+                        Ok(addr) => warn!("drop source packet from {}", addr),
+                        Err(_) => break,
+                    },
+                    Some(Ok(Message::Ping(_bin))) => {}
+                    Some(Ok(Message::Pong(_bin))) => {}
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
+                }
+            }
+        });
+        tokio::spawn(async move {
+            let mut buf = [0u8; MAX_PACKET_SIZE];
+            loop {
+                match tun_read.read(&mut buf) {
+                    Ok(bin) => match write.send(Message::Binary(Vec::from(bin))).await {
+                        Ok(_) => {}
+                        Err(_) => {
+                            break;
+                        }
+                    },
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        });
     } else {
         let listener = TcpListener::bind(&server_url)
             .await
