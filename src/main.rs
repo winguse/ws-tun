@@ -274,6 +274,7 @@ async fn main() {
                     continue;
                 }
             };
+            info!("accepted connection");
             let remote_addr = match tcp_stream.peer_addr() {
                 Ok(remote_addr) => {
                     info!("Peer address: {}", remote_addr);
@@ -284,6 +285,7 @@ async fn main() {
                     continue;
                 }
             };
+            info!("accepting websocket..");
 
             let ws_stream = match accept_async(tcp_stream).await {
                 Ok(ws_stream) => ws_stream,
@@ -293,7 +295,11 @@ async fn main() {
                 }
             };
 
+            info!("web socket is on");
+
             let (mut ws_write, ws_read) = ws_stream.split();
+
+            info!("generating ip for the client");
 
             let new_ip = {
                 let mut writable_table = route_table.write().await;
@@ -341,6 +347,8 @@ async fn main() {
                 new_ip
             };
             let new_ip_length = if new_ip.is_ipv4() { 32 } else { 128 };
+
+            info!("client ip: {}", new_ip);
 
             let mut allowed_ips: AllowedIps<()> = Default::default();
             allowed_ips.insert(new_ip, new_ip_length, ());
