@@ -24,7 +24,7 @@ const MAX_PACKET_SIZE: usize = (1 << 16) - 1;
 
 struct ClientInfo {
     ws_write: RwLock<SplitSink<WebSocketStream<TcpStream>, Message>>,
-    peer_addr: SocketAddr,
+    remote_addr: SocketAddr,
 }
 
 async fn server_ws_to_tun(
@@ -57,7 +57,7 @@ async fn server_ws_to_tun(
     }
     match route_table.write().await.remove(&client_ip) {
         None => warn!("removing client error, the item doesn't exist"),
-        Some(info) => info!("client {} terminated", info.peer_addr),
+        Some(info) => info!("client {} terminated", info.remote_addr),
     }
 }
 
@@ -171,19 +171,22 @@ async fn main() {
     }
 
     let tun = Arc::new(TunSocket::new(tun_name).unwrap());
-    println!("mtu {}", tun.mtu().unwrap());
+    let tun_name = tun.name().expect("should get tun name success");
+    info!("name: {}, mtu: {}", tun_name, tun.mtu().unwrap());
 
     if is_client_mode {
+        info!("connecting to {}", server_url);
         let (ws_stream, _) = connect_async(server_url)
             .await
             .expect("should connect to server success");
+        info!("connected");
         let (mut write, mut read) = ws_stream.split();
         match read.next().await {
             Some(Ok(Message::Text(init))) => {
                 let if_config: IfConfig = init
                     .parse()
                     .expect("should parse server if config correctly");
-                if_config.setup_tun(tun_name).await;
+                if_config.setup_tun(tun_name.as_str()).await;
             }
             _ => {
                 error!("unexpected response from server, expecting text message for setup tun interface");
@@ -249,7 +252,7 @@ async fn main() {
             }],
             routes: vec![],
         };
-        if_config.setup_tun(tun_name).await;
+        if_config.setup_tun(tun_name.as_str()).await;
 
         let route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -260,15 +263,35 @@ async fn main() {
         let allocation_end_ip = subnet.last_valid_ip();
         let mut previous_allocated_ip = server_ip;
 
-        while let Ok((stream, _)) = listener.accept().await {
-            let peer_addr = stream
-                .peer_addr()
-                .expect("connected streams should have a peer address");
-            info!("Peer address: {}", peer_addr);
+        info!("Server IP: {}", server_ip);
+        info!("IP pool: {} ~ {}", allocation_start_ip, allocation_end_ip);
 
-            let ws_stream = accept_async(stream)
-                .await
-                .expect("Error during the websocket handshake occurred");
+        loop {
+            let tcp_stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) => {
+                    error!("Failed to accept connection: {}", e);
+                    continue;
+                }
+            };
+            let remote_addr = match tcp_stream.peer_addr() {
+                Ok(remote_addr) => {
+                    info!("Peer address: {}", remote_addr);
+                    remote_addr
+                }
+                Err(e) => {
+                    error!("Failed to get peer addr: {}", e);
+                    continue;
+                }
+            };
+
+            let ws_stream = match accept_async(tcp_stream).await {
+                Ok(ws_stream) => ws_stream,
+                Err(e) => {
+                    error!("Failed to accept web socket stream: {}", e);
+                    continue;
+                }
+            };
 
             let (mut ws_write, ws_read) = ws_stream.split();
 
@@ -311,7 +334,7 @@ async fn main() {
                 writable_table.insert(
                     net_addr.addr,
                     ClientInfo {
-                        peer_addr,
+                        remote_addr,
                         ws_write: RwLock::new(ws_write),
                     },
                 );
