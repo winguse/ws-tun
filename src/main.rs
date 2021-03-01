@@ -195,7 +195,7 @@ async fn main() {
             }
         }
         let tun_read = tun.clone();
-        tokio::spawn(async move {
+        tokio::spawn_blocking(async move {
             let mut allowed_ips: AllowedIps<()> = Default::default();
             allowed_ips.insert("0.0.0.0".parse().unwrap(), 0, ());
             allowed_ips.insert("0::".parse().unwrap(), 0, ());
@@ -221,7 +221,7 @@ async fn main() {
                 }
             }
         });
-        tokio::spawn(async move {
+        tokio::spawn_blocking(async move {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             loop {
                 match tun_read.read(&mut buf) {
@@ -258,7 +258,7 @@ async fn main() {
         let route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        tokio::spawn(server_tun_to_ws(tun.clone(), route_table.clone()));
+        tokio::spawn_blocking(server_tun_to_ws(tun.clone(), route_table.clone()));
 
         let allocation_start_ip = next_ip_of(&server_ip);
         let allocation_end_ip = subnet.last_valid_ip();
@@ -353,7 +353,7 @@ async fn main() {
 
             let mut allowed_ips: AllowedIps<()> = Default::default();
             allowed_ips.insert(new_ip, new_ip_length, ());
-            tokio::spawn(server_ws_to_tun(
+            tokio::spawn_blocking(server_ws_to_tun(
                 tun.clone(),
                 ws_read,
                 new_ip,
