@@ -183,6 +183,7 @@ async fn main() {
         let (mut write, mut read) = ws_stream.split();
         match read.next().await {
             Some(Ok(Message::Text(init))) => {
+                info!("server config: {}", init);
                 let if_config: IfConfig = init
                     .parse()
                     .expect("should parse server if config correctly");
@@ -196,8 +197,8 @@ async fn main() {
         let tun_read = tun.clone();
         tokio::spawn(async move {
             let mut allowed_ips: AllowedIps<()> = Default::default();
-            allowed_ips.insert("0.0.0.0/0".parse().unwrap(), 0, ());
-            allowed_ips.insert("0::/0".parse().unwrap(), 0, ());
+            allowed_ips.insert("0.0.0.0".parse().unwrap(), 0, ());
+            allowed_ips.insert("0::".parse().unwrap(), 0, ());
             loop {
                 match read.next().await {
                     None => break,
