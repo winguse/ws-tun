@@ -40,7 +40,7 @@ fn read_ip_packet(packet: &[u8], source: bool) -> Result<IpAddr, String> {
             let off = if source {
                 IPV4_SRC_IP_OFF
             } else {
-                IPV4_SRC_IP_OFF
+                IPV4_DST_IP_OFF
             };
             let addr_bytes: [u8; IPV4_IP_SZ] = make_array(&packet[off..]);
             Ok(IpAddr::from(addr_bytes))
@@ -49,7 +49,7 @@ fn read_ip_packet(packet: &[u8], source: bool) -> Result<IpAddr, String> {
             let off = if source {
                 IPV6_SRC_IP_OFF
             } else {
-                IPV6_SRC_IP_OFF
+                IPV6_DST_IP_OFF
             };
             let addr_bytes: [u8; IPV6_IP_SZ] = make_array(&packet[off..]);
             Ok(IpAddr::from(addr_bytes))
