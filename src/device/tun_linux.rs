@@ -17,7 +17,13 @@ pub fn errno_str() -> String {
     c_str.to_string_lossy().into_owned()
 }
 
+#[cfg(not(target_env = "musl"))]
 const TUNSETIFF: u64 = 0x4004_54ca;
+
+// openwrt is mipsel-unknown-linux-musl
+// a temp match, might not ideal
+#[cfg(target_env = "musl")]
+const TUNSETIFF: i32 = -2147199798;
 
 #[repr(C)]
 union IfrIfru {
