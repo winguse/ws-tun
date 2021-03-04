@@ -184,7 +184,11 @@ async fn main() {
             .expect("macOS tun name should be utun[0-9]+.");
     }
 
-    let tun = Arc::new(TunSocket::new(tun_name).unwrap());
+    let tun = Arc::new(
+        TunSocket::new(tun_name).expect("create tun success"), // .set_non_blocking()
+                                                               // .expect("should set non blocked success")
+    );
+
     let tun_name = tun.name().expect("should get tun name success");
     info!("name: {}, mtu: {}", tun_name, tun.mtu().unwrap());
 
