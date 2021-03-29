@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use tokio::io::{self, AsyncReadExt};
 
 use clap::{crate_description, crate_name, crate_version, value_t, App, Arg};
 use futures_util::stream::SplitSink;
@@ -15,9 +16,12 @@ use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::protocol::Message, WebSocketStream,
 };
 
+use std::task::Poll::{Pending, Ready};
+use tokio::io::AsyncRead;
 use ws_tun::device::allowed_ips::AllowedIps;
+use ws_tun::device::pull_fn::poll_fn;
 use ws_tun::device::tun::TunSocket;
-use ws_tun::device::Tun;
+use ws_tun::device::{tun_read, Error, Tun};
 use ws_tun::logger;
 use ws_tun::utils::{next_ip_of, read_dst_ip, read_src_ip, AllowedIP, IfConfig};
 
@@ -109,6 +113,24 @@ async fn server_tun_to_ws(
     let _ = tun_tx.send(ClientTask::TUN).await;
 }
 
+async fn tun_reader(async_tun_read: Arc<TunSocket>, sender: Sender<Vec<u8>>) {
+    let mut buf = [0u8; MAX_PACKET_SIZE];
+    loop {
+        match tun_read(&async_tun_read, &mut buf).await {
+            Ok(bin) => {
+                let msg = Vec::from(bin);
+                match sender.send(msg).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        error!("error while sending tun read");
+                    }
+                }
+            }
+            Err(_) => error!("error while reading tun"),
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     log::set_logger(&logger::LOGGER).unwrap();
@@ -185,8 +207,10 @@ async fn main() {
     }
 
     let tun = Arc::new(
-        TunSocket::new(tun_name).expect("create tun success"), // .set_non_blocking()
-                                                               // .expect("should set non blocked success")
+        TunSocket::new(tun_name)
+            .expect("create tun success")
+            .set_non_blocking()
+            .expect("should set non blocked success"),
     );
 
     let tun_name = tun.name().expect("should get tun name success");
@@ -198,24 +222,9 @@ async fn main() {
     };
 
     let (tun_read_tx, mut tun_read_rx) = mpsc::channel(1);
+
     let tun_read = tun.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; MAX_PACKET_SIZE];
-        loop {
-            match tun_read.read(&mut buf) {
-                Ok(bin) => {
-                    let msg = Vec::from(bin);
-                    match tun_read_tx.blocking_send(msg) {
-                        Ok(_) => {}
-                        Err(_) => {
-                            error!("error while sending tun read");
-                        }
-                    }
-                }
-                Err(_) => error!("error while reading tun"),
-            }
-        }
-    });
+    tokio::task::spawn(tun_reader(tun_read, tun_read_tx));
 
     if is_client_mode {
         info!("connecting to {}", server_url);
