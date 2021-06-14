@@ -156,10 +156,10 @@ impl Tun for TunSocket {
         self.write(src)
     }
 
-    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<usize, Error> {
         match unsafe { read(self.fd, dst.as_mut_ptr() as _, dst.len()) } {
             -1 => Err(Error::IfaceRead(errno())),
-            n => Ok(&mut dst[..n as usize]),
+            n => Ok(n as usize),
         }
     }
 }
