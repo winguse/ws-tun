@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{self, AsyncReadExt};
 
 use clap::{crate_description, crate_name, crate_version, value_t, App, Arg};
 use futures_util::stream::SplitSink;
@@ -16,12 +15,9 @@ use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::protocol::Message, WebSocketStream,
 };
 
-use std::task::Poll::{Pending, Ready};
-use tokio::io::AsyncRead;
 use ws_tun::device::allowed_ips::AllowedIps;
-use ws_tun::device::pull_fn::poll_fn;
 use ws_tun::device::tun::TunSocket;
-use ws_tun::device::{tun_read, Error, Tun};
+use ws_tun::device::{tun_read, Tun};
 use ws_tun::logger;
 use ws_tun::utils::{next_ip_of, read_dst_ip, read_src_ip, AllowedIP, IfConfig};
 
@@ -115,10 +111,11 @@ async fn server_tun_to_ws(
 
 async fn tun_reader(async_tun_read: Arc<TunSocket>, sender: Sender<Vec<u8>>) {
     let mut buf = [0u8; MAX_PACKET_SIZE];
+
     loop {
         match tun_read(&async_tun_read, &mut buf).await {
-            Ok(bin) => {
-                let msg = Vec::from(bin);
+            Ok(len) => {
+                let msg = Vec::from(&buf[..len]);
                 match sender.send(msg).await {
                     Ok(_) => {}
                     Err(_) => {

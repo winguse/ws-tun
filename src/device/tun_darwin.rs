@@ -236,7 +236,7 @@ impl Tun for TunSocket {
         self.write(src, AF_INET6 as u8)
     }
 
-    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error> {
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<usize, Error> {
         let mut hdr = [0u8; 4];
 
         let mut iov = [
@@ -262,8 +262,8 @@ impl Tun for TunSocket {
 
         match unsafe { recvmsg(self.fd, &mut msg_hdr, 0) } {
             -1 => Err(Error::IfaceRead(errno())),
-            0..=4 => Ok(&mut dst[..0]),
-            n => Ok(&mut dst[..(n - 4) as usize]),
+            0..=4 => Ok(0),
+            n => Ok((n - 4) as usize),
         }
     }
 }

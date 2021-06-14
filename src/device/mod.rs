@@ -46,34 +46,40 @@ pub trait Tun: 'static + AsRawFd + Sized + Send + Sync {
 
     fn write4(&self, src: &[u8]) -> usize;
     fn write6(&self, src: &[u8]) -> usize;
-    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<&'a mut [u8], Error>;
+    fn read<'a>(&self, dst: &'a mut [u8]) -> Result<usize, Error>;
 }
 
-pub struct TunRead {
-    tun: TunSocket,
-    dst: &'_ mut [u8],
+pub struct TunRead<'a> {
+    tun: &'a TunSocket,
+    dst: &'a mut [u8],
 }
 
-pub fn tun_read(tun: TunSocket, dst: &mut [u8]) -> TunRead {
+impl<'a> TunRead<'a> {
+    pub fn read(&mut self) -> Result<usize, Error> {
+        self.tun.read(&mut self.dst)
+    }
+}
+
+pub fn tun_read<'a>(tun: &'a TunSocket, dst: &'a mut [u8]) -> TunRead<'a> {
     TunRead { tun, dst }
 }
 
-impl Future for TunRead {
-    type Output = Result<&'_ mut [u8], Error>;
+impl<'a> Future for TunRead<'a> {
+    type Output = Result<usize, Error>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.tun.read(&mut self.dst) {
-            Ok(buf) => Ready(Ok(buf)),
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.read() {
+            Ok(len) => Ready(Ok(len)),
             Err(Error::IfaceRead(errno)) => {
                 let ek = std::io::Error::from_raw_os_error(errno).kind();
                 if ek == std::io::ErrorKind::Interrupted || ek == std::io::ErrorKind::WouldBlock {
-                    cx.waker().wake(); // what's this?
+                    // cx.waker().wake(); // what's this?
                     Pending
                 } else {
                     Ready(Err(Error::IfaceRead(errno)))
                 }
             }
-            other => Ready(other),
+            Err(e) => Ready(Err(e)),
         }
     }
 }
