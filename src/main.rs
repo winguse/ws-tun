@@ -9,11 +9,15 @@ use futures_util::{SinkExt, StreamExt};
 use log::LevelFilter;
 use log::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::select;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::task::spawn;
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::protocol::Message, WebSocketStream,
 };
+use tokio_util::sync::CancellationToken;
 
 use ws_tun::device::allowed_ips::AllowedIps;
 use ws_tun::device::tun::TunSocket;
@@ -28,12 +32,7 @@ struct ClientInfo {
     remote_addr: SocketAddr,
 }
 
-enum ExitEvent {
-    WS,
-    TUN,
-    CTRLC,
-}
-
+/// server handle client web socket connection
 async fn server_ws_to_tun(
     tun: Arc<TunSocket>,
     mut read: SplitStream<WebSocketStream<TcpStream>>,
@@ -41,33 +40,42 @@ async fn server_ws_to_tun(
     allowed_ips: AllowedIps<()>,
     route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
     ws_write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
+    exit_token: CancellationToken,
 ) {
     loop {
         debug!("server ws: wait for packet");
-        match read.next().await {
-            None => break,
-            Some(Ok(Message::Text(_txt))) => {}
-            Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
-                Ok(addr) if allowed_ips.find(addr).is_some() => {
-                    debug!("got ws from {}", addr);
-                    if addr.is_ipv4() {
-                        tun.write4(&bin);
-                    } else {
-                        tun.write6(&bin);
+        select! {
+            _ = exit_token.cancelled() => {
+                info!("server tun exit because receive cancel");
+                break;
+            }
+            res = read.next() => {
+                match res {
+                    None => break,
+                    Some(Ok(Message::Text(_txt))) => {}
+                    Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
+                        Ok(addr) if allowed_ips.find(addr).is_some() => {
+                            debug!("got ws from {}", addr);
+                            if addr.is_ipv4() {
+                                tun.write4(&bin);
+                            } else {
+                                tun.write6(&bin);
+                            }
+                        }
+                        Ok(addr) => warn!("server ws: drop source packet from {}", addr),
+                        Err(_) => break,
+                    },
+                    Some(Ok(Message::Ping(bin))) => {
+                        match ws_write.lock().await.send(Message::Pong(bin)).await {
+                            Ok(_) => {}
+                            Err(e) => error!("Error found when sending Pong: {}", e),
+                        }
                     }
-                }
-                Ok(addr) => warn!("server ws: drop source packet from {}", addr),
-                Err(_) => break,
-            },
-            Some(Ok(Message::Ping(bin))) => {
-                match ws_write.lock().await.send(Message::Ping(bin)).await {
-                    Ok(_) => {}
-                    Err(e) => error!("Error found when sending Pong: {}", e),
+                    Some(Ok(Message::Pong(_bin))) => {}
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Err(_)) => break,
                 }
             }
-            Some(Ok(Message::Pong(_bin))) => {}
-            Some(Ok(Message::Close(_))) => break,
-            Some(Err(_)) => break,
         }
     }
     match route_table.write().await.remove(&client_ip) {
@@ -76,61 +84,83 @@ async fn server_ws_to_tun(
     }
 }
 
+/// server handle package from tun and send to valid destination web socket
 async fn server_tun_to_ws(
     mut tun_read_rx: Receiver<Vec<u8>>,
     route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
-    tun_tx: Sender<ExitEvent>,
+    exit_token: CancellationToken,
 ) {
     loop {
         debug!("server tun: wait for packet");
-        match tun_read_rx.recv().await {
-            None => {
-                error!("server tun: receive nothing");
+        select! {
+            _ = exit_token.cancelled() => {
+                info!("server tun exit because receive cancel");
                 break;
             }
-            Some(bin) => {
-                match read_dst_ip(&bin) {
-                    Ok(ip) => match route_table.read().await.get(&ip) {
-                        Some(info) => {
-                            match info
-                                .ws_write
-                                .lock()
-                                .await
-                                .send(Message::Binary(Vec::from(bin)))
-                                .await
-                            {
-                                Ok(_) => debug!("server tun: sending data to {}", ip),
-                                Err(e) => error!("error while sending data to {}: {}", ip, e),
-                            }
-                        }
-                        None => info!("destination {} is not found, dropped", ip),
-                    },
-                    Err(msg) => {
-                        error!("failed to parse ip from received packet: {}", msg);
+            res = tun_read_rx.recv() => {
+                match res {
+                    None => {
+                        error!("server tun: receive nothing, exit..");
+                        break;
                     }
-                };
-            }
-        }
-    }
-    info!("server tun: exit");
-    let _ = tun_tx.send(ExitEvent::TUN).await;
-}
-
-async fn tun_reader(async_tun_read: Arc<TunSocket>, sender: Sender<Vec<u8>>) {
-    let mut buf = [0u8; MAX_PACKET_SIZE];
-
-    loop {
-        match tun_read(&async_tun_read, &mut buf).await {
-            Ok(len) => {
-                let msg = Vec::from(&buf[..len]);
-                match sender.send(msg).await {
-                    Ok(_) => {}
-                    Err(_) => {
-                        error!("error while sending tun read");
+                    Some(bin) => {
+                        match read_dst_ip(&bin) {
+                            Ok(ip) => match route_table.read().await.get(&ip) {
+                                Some(info) => {
+                                    match info
+                                        .ws_write
+                                        .lock()
+                                        .await
+                                        .send(Message::Binary(Vec::from(bin)))
+                                        .await
+                                    {
+                                        Ok(_) => debug!("server tun: sending data to {}", ip),
+                                        Err(e) => error!("error while sending data to {}: {}", ip, e),
+                                    }
+                                }
+                                None => info!("destination {} is not found, dropped", ip),
+                            },
+                            Err(msg) => {
+                                error!("failed to parse ip from received packet: {}", msg);
+                            }
+                        };
                     }
                 }
             }
-            Err(_) => error!("error while reading tun"),
+        }
+    }
+    if !exit_token.is_cancelled() {
+        exit_token.cancel();
+    }
+}
+
+/// the tun reader
+/// read the tun package and send to channel
+async fn tun_reader(
+    async_tun_read: Arc<TunSocket>,
+    sender: Sender<Vec<u8>>,
+    exit_token: CancellationToken,
+) {
+    let mut buf = [0u8; MAX_PACKET_SIZE];
+    loop {
+        select! {
+            _ = exit_token.cancelled() => {
+                break;
+            }
+            res = tun_read(&async_tun_read, &mut buf) => {
+                match res {
+                    Ok(len) => {
+                        let msg = Vec::from(&buf[..len]);
+                        match sender.send(msg).await {
+                            Ok(_) => {}
+                            Err(_) => {
+                                error!("error while sending tun read");
+                            }
+                        }
+                    }
+                    Err(_) => error!("error while reading tun"),
+                }
+            }
         }
     }
 }
@@ -188,6 +218,15 @@ async fn main() {
                     .default_value("32")
                     .required(false),
             )
+            .arg(
+                Arg::with_name("close-timeout")
+                    .short("c")
+                    .long("close-timeout")
+                    .value_name("CLOSE_TIMEOUT")
+                    .help("timeout before killing tasks not exit")
+                    .default_value("5")
+                    .required(false),
+            )
             .get_matches()
     };
 
@@ -202,6 +241,8 @@ async fn main() {
     let mtu = value_t!(matches.value_of("mtu"), usize).expect("should be a valid mtu config");
     let max_client = value_t!(matches.value_of("max-client"), usize)
         .expect("should be a valid number of max-client config");
+    let close_timeout = value_t!(matches.value_of("close-timeout"), u64)
+        .expect("should be a valid number of close-timeout");
     let is_client_mode = server_url.starts_with("ws");
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -209,6 +250,8 @@ async fn main() {
         ws_tun::device::tun::parse_utun_name(&tun_name)
             .expect("macOS tun name should be utun[0-9]+.");
     }
+
+    let exit_token = CancellationToken::new();
 
     let tun = Arc::new(
         TunSocket::new(tun_name)
@@ -220,20 +263,32 @@ async fn main() {
     let tun_name = tun.name().expect("should get tun name success");
     info!("name: {}, mtu: {}", tun_name, tun.mtu().unwrap());
 
-    let (tun_tx, ctrl_c_tx, ws_tx, mut ch_rx) = {
-        let (tx, rx) = mpsc::channel(1);
-        (tx.clone(), tx.clone(), tx, rx)
-    };
+    let tasks = Arc::new(RwLock::new(Vec::new()));
 
-    let ctrl_c_task = tokio::task::spawn(async move {
-        tokio::signal::ctrl_c().await.expect("failed to listen for event");
-        let _ = ctrl_c_tx.send(ExitEvent::CTRLC).await;
-    });
+    {
+        // create ctrl c task
+        let ctrl_exit_token = exit_token.clone();
+        tasks.write().await.push(spawn(async move {
+            select! {
+                _ = ctrl_exit_token.cancelled() => {info!("ctrl-c listener exit because of canceled")},
+                _ = tokio::signal::ctrl_c() => {
+                    info!("got ctrl-c signal");
+                    ctrl_exit_token.cancel();
+                },
+            }
+        }));
+    }
 
     let (tun_read_tx, mut tun_read_rx) = mpsc::channel(1);
 
-    let tun_read = tun.clone();
-    tokio::task::spawn(tun_reader(tun_read, tun_read_tx));
+    {
+        // create tun reader task
+        tasks.write().await.push(spawn(tun_reader(
+            tun.clone(),
+            tun_read_tx,
+            exit_token.clone(),
+        )));
+    }
 
     if is_client_mode {
         info!("connecting to {}", server_url);
@@ -256,67 +311,83 @@ async fn main() {
             }
         }
 
-        let client_ws_task = tokio::task::spawn(async move {
-            let mut allowed_ips: AllowedIps<()> = Default::default();
-            allowed_ips.insert("0.0.0.0".parse().unwrap(), 0, ());
-            allowed_ips.insert("0::".parse().unwrap(), 0, ());
-            loop {
-                debug!("client ws: wait for packet");
-                match read.next().await {
-                    None => break,
-                    Some(Ok(Message::Text(_txt))) => {}
-                    Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
-                        Ok(addr) if allowed_ips.find(addr).is_some() => {
-                            debug!("client ws: got package from {}", addr);
-                            if addr.is_ipv4() {
-                                tun.write4(&bin);
-                            } else {
-                                tun.write6(&bin);
+        {
+            // create client task for reading web socket
+            let client_ws_exit = exit_token.clone();
+            tasks.write().await.push(spawn(async move {
+                let mut allowed_ips: AllowedIps<()> = Default::default();
+                allowed_ips.insert("0.0.0.0".parse().unwrap(), 0, ());
+                allowed_ips.insert("0::".parse().unwrap(), 0, ());
+                loop {
+                    debug!("client ws: wait for packet");
+                    select! {
+                        _ = client_ws_exit.cancelled() => {
+                            info!("client ws reader exit because of canceled");
+                            break;
+                        },
+                        res = read.next() => {
+                            match res {
+                                None => {
+                                    warn!("client ws read nothing, exit..");
+                                    break;
+                                },
+                                Some(Ok(Message::Text(_txt))) => {}
+                                Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
+                                    Ok(addr) if allowed_ips.find(addr).is_some() => {
+                                        debug!("client ws: got package from {}", addr);
+                                        if addr.is_ipv4() {
+                                            tun.write4(&bin);
+                                        } else {
+                                            tun.write6(&bin);
+                                        }
+                                    }
+                                    Ok(addr) => warn!("client ws: drop source packet from {}", addr),
+                                    Err(_) => break,
+                                },
+                                Some(Ok(Message::Ping(_bin))) => {}
+                                Some(Ok(Message::Pong(_bin))) => {}
+                                Some(Ok(Message::Close(_))) => break,
+                                Some(Err(_)) => break,
                             }
                         }
-                        Ok(addr) => warn!("client ws: drop source packet from {}", addr),
-                        Err(_) => break,
-                    },
-                    Some(Ok(Message::Ping(_bin))) => {}
-                    Some(Ok(Message::Pong(_bin))) => {}
-                    Some(Ok(Message::Close(_))) => break,
-                    Some(Err(_)) => break,
-                }
-            }
-            info!("client ws: exit");
-            let _ = ws_tx.send(ExitEvent::WS).await;
-        });
-        let client_tun_task = tokio::task::spawn(async move {
-            loop {
-                debug!("client tun: wait for tun package");
-                match tun_read_rx.recv().await {
-                    None => {
-                        error!("client tun: receive nothing");
-                        break;
                     }
-                    Some(bin) => match write.send(Message::Binary(Vec::from(bin))).await {
-                        Ok(_) => debug!("client tun: send to ws"),
-                        Err(_) => break,
-                    },
                 }
-            }
-            info!("client tun: exit");
-            let _ = tun_tx.send(ExitEvent::TUN).await;
-        });
-
-        match ch_rx.recv().await.expect("should receive exit task id") {
-            ExitEvent::WS => {
-                client_tun_task.abort();
-                ctrl_c_task.abort();
-            },
-            ExitEvent::TUN => {
-                client_ws_task.abort();
-                ctrl_c_task.abort();
-            },
-            ExitEvent::CTRLC => {
-                client_ws_task.abort();
-                client_tun_task.abort();
-            }
+                info!("client ws: exit");
+                if !client_ws_exit.is_cancelled() {
+                    client_ws_exit.cancel();
+                }
+            }));
+        }
+        {
+            // create client task for read tun
+            let client_tun_exit_token = exit_token.clone();
+            tasks.write().await.push(spawn(async move {
+                loop {
+                    debug!("client tun: wait for tun package");
+                    select! {
+                        _ = client_tun_exit_token.cancelled() => {
+                            info!("client tun reader exit because of canceled");
+                            break;
+                        },
+                        res = tun_read_rx.recv() => {
+                            match res {
+                                None => {
+                                    error!("client tun: receive nothing");
+                                    break;
+                                }
+                                Some(bin) => match write.send(Message::Binary(Vec::from(bin))).await {
+                                    Ok(_) => debug!("client tun: send to ws"),
+                                    Err(_) => break,
+                                },
+                            }
+                        }
+                    }
+                }
+                info!("client tun: exit");
+                if !client_tun_exit_token.is_cancelled() {
+                    client_tun_exit_token.cancel();
+                }
+            }));
         }
     } else {
         let listener = TcpListener::bind(&server_url)
@@ -339,8 +410,11 @@ async fn main() {
         let route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
-        let server_tun_task =
-            tokio::task::spawn(server_tun_to_ws(tun_read_rx, route_table.clone(), tun_tx));
+        tasks.write().await.push(spawn(server_tun_to_ws(
+            tun_read_rx,
+            route_table.clone(),
+            exit_token.clone(),
+        )));
 
         let allocation_start_ip = next_ip_of(&server_ip);
         let allocation_end_ip = subnet.last_valid_ip();
@@ -348,120 +422,131 @@ async fn main() {
         info!("Server IP: {}", server_ip);
         info!("IP pool: {} ~ {}", allocation_start_ip, allocation_end_ip);
 
-        let server_ws_task = tokio::task::spawn(async move {
-            let _ = ws_tx; // we are not using this for now, as the loop never exist itself
-            loop {
-                let tcp_stream = match listener.accept().await {
-                    Ok((stream, _)) => stream,
-                    Err(e) => {
-                        error!("Failed to accept connection: {}", e);
-                        continue;
-                    }
-                };
-                debug!("accepted connection");
-                let remote_addr = match tcp_stream.peer_addr() {
-                    Ok(remote_addr) => {
-                        info!("Peer address: {}", remote_addr);
-                        remote_addr
-                    }
-                    Err(e) => {
-                        error!("Failed to get peer addr: {}", e);
-                        continue;
-                    }
-                };
-                debug!("accepting websocket..");
-
-                let ws_stream = match accept_async(tcp_stream).await {
-                    Ok(ws_stream) => ws_stream,
-                    Err(e) => {
-                        error!("Failed to accept web socket stream: {}", e);
-                        continue;
-                    }
-                };
-
-                let (mut ws_write, ws_read) = ws_stream.split();
-
-                info!("generating ip for the client");
-
-                let (new_ip, current_ws_write) = {
-                    let mut writable_table = route_table.write().await;
-                    if writable_table.len() > max_client {
-                        warn!(
-                            "max client number {} reached, the client will be disconnected.",
-                            max_client
-                        );
-                        continue;
-                    }
-                    let mut new_ip: IpAddr = allocation_start_ip;
-                    loop {
-                        if !writable_table.contains_key(&new_ip) {
+        {
+            let server_ws_exit_token = exit_token.clone();
+            let server_conn_tasks = tasks.clone();
+            tasks.write().await.push(spawn(async move {
+                loop {
+                    select! {
+                        _ = server_ws_exit_token.cancelled() => {
+                            info!("server tun exit because receive cancel");
                             break;
                         }
-                        new_ip = next_ip_of(&new_ip);
-                        if new_ip == allocation_end_ip {
-                            new_ip = allocation_start_ip;
+                        res = listener.accept() => {
+                            let tcp_stream = match res {
+                                Ok((stream, _)) => stream,
+                                Err(e) => {
+                                    error!("Failed to accept connection: {}", e);
+                                    continue;
+                                }
+                            };
+                            debug!("accepted connection");
+                            let remote_addr = match tcp_stream.peer_addr() {
+                                Ok(remote_addr) => {
+                                    info!("Peer address: {}", remote_addr);
+                                    remote_addr
+                                }
+                                Err(e) => {
+                                    error!("Failed to get peer addr: {}", e);
+                                    continue;
+                                }
+                            };
+                            debug!("accepting websocket..");
+
+                            let ws_stream = match accept_async(tcp_stream).await {
+                                Ok(ws_stream) => ws_stream,
+                                Err(e) => {
+                                    error!("Failed to accept web socket stream: {}", e);
+                                    continue;
+                                }
+                            };
+
+                            let (mut ws_write, ws_read) = ws_stream.split();
+
+                            info!("generating ip for the client");
+
+                            let (new_ip, current_ws_write) = {
+                                let mut writable_table = route_table.write().await;
+                                if writable_table.len() > max_client {
+                                    warn!(
+                                        "max client number {} reached, the client will be disconnected.",
+                                        max_client
+                                    );
+                                    continue;
+                                }
+                                let mut new_ip: IpAddr = allocation_start_ip;
+                                loop {
+                                    if !writable_table.contains_key(&new_ip) {
+                                        break;
+                                    }
+                                    new_ip = next_ip_of(&new_ip);
+                                    if new_ip == allocation_end_ip {
+                                        new_ip = allocation_start_ip;
+                                    }
+                                }
+                                let net_addr = AllowedIP {
+                                    addr: new_ip,
+                                    cidr: subnet.cidr,
+                                };
+                                let if_config = IfConfig {
+                                    mtu,
+                                    addresses: vec![net_addr],
+                                    routes: vec![net_addr],
+                                };
+                                match ws_write.send(Message::Text(if_config.to_string())).await {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!("failed to send if config to client: {}", e);
+                                        continue;
+                                    }
+                                }
+                                let current_ws_write = Arc::new(Mutex::new(ws_write));
+                                writable_table.insert(
+                                    new_ip,
+                                    ClientInfo {
+                                        remote_addr,
+                                        ws_write: current_ws_write.clone(),
+                                    },
+                                );
+                                (new_ip, current_ws_write)
+                            };
+                            let new_ip_length = if new_ip.is_ipv4() { 32 } else { 128 };
+
+                            info!("client ip: {}", new_ip);
+
+                            let mut allowed_ips: AllowedIps<()> = Default::default();
+                            allowed_ips.insert(new_ip, new_ip_length, ());
+                            {
+                                server_conn_tasks.write().await.push(
+                                    spawn(server_ws_to_tun(
+                                        tun.clone(),
+                                        ws_read,
+                                        new_ip,
+                                        allowed_ips,
+                                        route_table.clone(),
+                                        current_ws_write,
+                                        server_ws_exit_token.clone(),
+                                    ))
+                                );
+                            }
                         }
                     }
-                    let net_addr = AllowedIP {
-                        addr: new_ip,
-                        cidr: subnet.cidr,
-                    };
-                    let if_config = IfConfig {
-                        mtu,
-                        addresses: vec![net_addr],
-                        routes: vec![net_addr],
-                    };
-                    match ws_write.send(Message::Text(if_config.to_string())).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("failed to send if config to client: {}", e);
-                            continue;
-                        }
-                    }
-                    let current_ws_write = Arc::new(Mutex::new(ws_write));
-                    writable_table.insert(
-                        new_ip,
-                        ClientInfo {
-                            remote_addr,
-                            ws_write: current_ws_write.clone(),
-                        },
-                    );
-                    (new_ip, current_ws_write)
-                };
-                let new_ip_length = if new_ip.is_ipv4() { 32 } else { 128 };
-
-                info!("client ip: {}", new_ip);
-
-                let mut allowed_ips: AllowedIps<()> = Default::default();
-                allowed_ips.insert(new_ip, new_ip_length, ());
-                tokio::task::spawn(server_ws_to_tun(
-                    tun.clone(),
-                    ws_read,
-                    new_ip,
-                    allowed_ips,
-                    route_table.clone(),
-                    current_ws_write,
-                ));
-            }
-            // Never be here for now
-            // info!("server ws: exit");
-            // let _ = ws_tx.send(ExitEvent::WS).await;
-        });
-        match ch_rx.recv().await.expect("should receive exit task id") {      
-            ExitEvent::WS => {
-                server_tun_task.abort();
-                ctrl_c_task.abort();
-            },
-            ExitEvent::TUN => {
-                server_ws_task.abort();
-                ctrl_c_task.abort();
-            },
-            ExitEvent::CTRLC => {
-                server_ws_task.abort();
-                server_tun_task.abort();
-            },
+                }
+            }));
         }
     }
+
+    let _ = exit_token.cancelled().await;
+    info!("waiting {} seconds for tasks exiting", close_timeout);
+    sleep(Duration::from_secs(close_timeout)).await;
+    info!("killing running task");
+    {
+        let task_list = tasks.read().await;
+        for i in 0..task_list.len() {
+            task_list[i].abort();
+        }
+    }
+    info!("exit");
 
     ()
 }
