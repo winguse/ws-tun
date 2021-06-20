@@ -62,7 +62,7 @@ async fn server_ws_to_tun(
                                 tun.inner.get_ref().write6(&bin);
                             }
                         }
-                        Ok(addr) => warn!("server ws: drop source packet from {}", addr),
+                        Ok(addr) => debug!("server ws: drop source packet from {} to {}", addr, read_dst_ip(&bin).unwrap()),
                         Err(_) => break,
                     },
                     Some(Ok(Message::Ping(_bin))) => { /* the lib already handled response */ }
@@ -114,7 +114,7 @@ async fn server_tun_to_ws(
                                     }
                                 }
                                 None => {
-                                    info!("from {} to destination {} is not found, dropped", read_src_ip(&bin).expect("should read ip success"), ip)
+                                    debug!("from {} to destination {} is not found, dropped", read_src_ip(&bin).expect("should read ip success"), ip)
                                 },
                             },
                             Err(msg) => {
@@ -359,21 +359,21 @@ async fn main() {
                                 Some(Ok(Message::Text(_txt))) => {}
                                 Some(Ok(Message::Binary(bin))) => match read_src_ip(&bin) {
                                     Ok(addr) if allowed_ips.find(addr).is_some() => {
-                                        debug!("client ws: got package from {}", addr);
+                                        debug!("client ws -> tun, {} -> {}", addr, read_dst_ip(&bin).unwrap());
                                         if addr.is_ipv4() {
                                             tun.inner.get_ref().write4(&bin);
                                         } else {
                                             tun.inner.get_ref().write6(&bin);
                                         }
                                     }
-                                    Ok(addr) => warn!("client ws: drop source packet from {} to {}", addr, read_dst_ip(&bin).expect("read dest success")),
+                                    Ok(addr) => debug!("client ws: drop source packet from {} to {}", addr, read_dst_ip(&bin).unwrap()),
                                     Err(_) => break,
                                 },
                                 Some(Ok(Message::Ping(_bin))) => { /* no need to do, the lib will return pong */ }
                                 Some(Ok(Message::Pong(bin))) => {
                                     if bin.len() == 16 {
                                         let dt = get_time() - bin.as_slice().read_u128::<BigEndian>().expect("");
-                                        info!("received pong, latency: {} micro seconds", dt);
+                                        debug!("received pong, latency: {} micro seconds", dt);
                                     }
                                 }
                                 Some(Ok(Message::Close(_))) => break,
@@ -411,9 +411,12 @@ async fn main() {
                                     error!("client tun: receive nothing");
                                     break;
                                 }
-                                Some(bin) => match wrapped_write.lock().await.send(Message::Binary(Vec::from(bin))).await {
-                                    Ok(_) => debug!("client tun: send to ws"),
-                                    Err(_) => break,
+                                Some(bin) => {
+                                    info!("client tun -> ws, {} -> {}", read_src_ip(&bin).unwrap(), read_dst_ip(&bin).unwrap());
+                                    match wrapped_write.lock().await.send(Message::Binary(Vec::from(bin))).await {
+                                        Ok(_) => {},
+                                        Err(_) => break,
+                                    }
                                 },
                             }
                         }
