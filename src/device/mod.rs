@@ -67,13 +67,13 @@ pub fn tun_read<'a>(tun: &'a TunSocket, dst: &'a mut [u8]) -> TunRead<'a> {
 impl<'a> Future for TunRead<'a> {
     type Output = Result<usize, Error>;
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.read() {
             Ok(len) => Ready(Ok(len)),
             Err(Error::IfaceRead(errno)) => {
                 let ek = std::io::Error::from_raw_os_error(errno).kind();
                 if ek == std::io::ErrorKind::Interrupted || ek == std::io::ErrorKind::WouldBlock {
-                    // cx.waker().wake(); // what's this?
+                    cx.waker().wake_by_ref();
                     Pending
                 } else {
                     Ready(Err(Error::IfaceRead(errno)))
