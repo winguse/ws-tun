@@ -10,7 +10,7 @@ use log::LevelFilter;
 use log::{debug, error, info, warn};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_tungstenite::{
     accept_async, connect_async, tungstenite::protocol::Message, WebSocketStream,
 };
@@ -24,13 +24,14 @@ use ws_tun::utils::{next_ip_of, read_dst_ip, read_src_ip, AllowedIP, IfConfig};
 const MAX_PACKET_SIZE: usize = (1 << 16) - 1;
 
 struct ClientInfo {
-    ws_write: RwLock<SplitSink<WebSocketStream<TcpStream>, Message>>,
+    ws_write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     remote_addr: SocketAddr,
 }
 
-enum ClientTask {
+enum ExitEvent {
     WS,
     TUN,
+    CTRLC,
 }
 
 async fn server_ws_to_tun(
@@ -39,6 +40,7 @@ async fn server_ws_to_tun(
     client_ip: IpAddr,
     allowed_ips: AllowedIps<()>,
     route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
+    ws_write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
 ) {
     loop {
         debug!("server ws: wait for packet");
@@ -57,7 +59,12 @@ async fn server_ws_to_tun(
                 Ok(addr) => warn!("server ws: drop source packet from {}", addr),
                 Err(_) => break,
             },
-            Some(Ok(Message::Ping(_bin))) => {}
+            Some(Ok(Message::Ping(bin))) => {
+                match ws_write.lock().await.send(Message::Ping(bin)).await {
+                    Ok(_) => {}
+                    Err(e) => error!("Error found when sending Pong: {}", e),
+                }
+            }
             Some(Ok(Message::Pong(_bin))) => {}
             Some(Ok(Message::Close(_))) => break,
             Some(Err(_)) => break,
@@ -72,7 +79,7 @@ async fn server_ws_to_tun(
 async fn server_tun_to_ws(
     mut tun_read_rx: Receiver<Vec<u8>>,
     route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
-    tun_tx: Sender<ClientTask>,
+    tun_tx: Sender<ExitEvent>,
 ) {
     loop {
         debug!("server tun: wait for packet");
@@ -87,7 +94,7 @@ async fn server_tun_to_ws(
                         Some(info) => {
                             match info
                                 .ws_write
-                                .write()
+                                .lock()
                                 .await
                                 .send(Message::Binary(Vec::from(bin)))
                                 .await
@@ -106,7 +113,7 @@ async fn server_tun_to_ws(
         }
     }
     info!("server tun: exit");
-    let _ = tun_tx.send(ClientTask::TUN).await;
+    let _ = tun_tx.send(ExitEvent::TUN).await;
 }
 
 async fn tun_reader(async_tun_read: Arc<TunSocket>, sender: Sender<Vec<u8>>) {
@@ -213,10 +220,15 @@ async fn main() {
     let tun_name = tun.name().expect("should get tun name success");
     info!("name: {}, mtu: {}", tun_name, tun.mtu().unwrap());
 
-    let (tun_tx, ws_tx, mut ch_rx) = {
+    let (tun_tx, ctrl_c_tx, ws_tx, mut ch_rx) = {
         let (tx, rx) = mpsc::channel(1);
-        (tx.clone(), tx, rx)
+        (tx.clone(), tx.clone(), tx, rx)
     };
+
+    let ctrl_c_task = tokio::task::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("failed to listen for event");
+        let _ = ctrl_c_tx.send(ExitEvent::CTRLC).await;
+    });
 
     let (tun_read_tx, mut tun_read_rx) = mpsc::channel(1);
 
@@ -272,7 +284,7 @@ async fn main() {
                 }
             }
             info!("client ws: exit");
-            let _ = ws_tx.send(ClientTask::WS).await;
+            let _ = ws_tx.send(ExitEvent::WS).await;
         });
         let client_tun_task = tokio::task::spawn(async move {
             loop {
@@ -289,11 +301,22 @@ async fn main() {
                 }
             }
             info!("client tun: exit");
-            let _ = tun_tx.send(ClientTask::TUN).await;
+            let _ = tun_tx.send(ExitEvent::TUN).await;
         });
+
         match ch_rx.recv().await.expect("should receive exit task id") {
-            ClientTask::WS => client_tun_task.abort(),
-            ClientTask::TUN => client_ws_task.abort(),
+            ExitEvent::WS => {
+                client_tun_task.abort();
+                ctrl_c_task.abort();
+            },
+            ExitEvent::TUN => {
+                client_ws_task.abort();
+                ctrl_c_task.abort();
+            },
+            ExitEvent::CTRLC => {
+                client_ws_task.abort();
+                client_tun_task.abort();
+            }
         }
     } else {
         let listener = TcpListener::bind(&server_url)
@@ -321,7 +344,6 @@ async fn main() {
 
         let allocation_start_ip = next_ip_of(&server_ip);
         let allocation_end_ip = subnet.last_valid_ip();
-        let mut previous_allocated_ip = server_ip;
 
         info!("Server IP: {}", server_ip);
         info!("IP pool: {} ~ {}", allocation_start_ip, allocation_end_ip);
@@ -361,7 +383,7 @@ async fn main() {
 
                 info!("generating ip for the client");
 
-                let new_ip = {
+                let (new_ip, current_ws_write) = {
                     let mut writable_table = route_table.write().await;
                     if writable_table.len() > max_client {
                         warn!(
@@ -370,17 +392,16 @@ async fn main() {
                         );
                         continue;
                     }
-                    let mut new_ip: IpAddr;
+                    let mut new_ip: IpAddr = allocation_start_ip;
                     loop {
-                        new_ip = next_ip_of(&previous_allocated_ip);
-                        if new_ip == allocation_end_ip {
-                            new_ip = allocation_start_ip;
-                        }
                         if !writable_table.contains_key(&new_ip) {
                             break;
                         }
+                        new_ip = next_ip_of(&new_ip);
+                        if new_ip == allocation_end_ip {
+                            new_ip = allocation_start_ip;
+                        }
                     }
-                    previous_allocated_ip = new_ip;
                     let net_addr = AllowedIP {
                         addr: new_ip,
                         cidr: subnet.cidr,
@@ -397,14 +418,15 @@ async fn main() {
                             continue;
                         }
                     }
+                    let current_ws_write = Arc::new(Mutex::new(ws_write));
                     writable_table.insert(
-                        net_addr.addr,
+                        new_ip,
                         ClientInfo {
                             remote_addr,
-                            ws_write: RwLock::new(ws_write),
+                            ws_write: current_ws_write.clone(),
                         },
                     );
-                    new_ip
+                    (new_ip, current_ws_write)
                 };
                 let new_ip_length = if new_ip.is_ipv4() { 32 } else { 128 };
 
@@ -418,15 +440,26 @@ async fn main() {
                     new_ip,
                     allowed_ips,
                     route_table.clone(),
+                    current_ws_write,
                 ));
             }
             // Never be here for now
             // info!("server ws: exit");
-            // let _ = ws_tx.send(ClientTask::WS).await;
+            // let _ = ws_tx.send(ExitEvent::WS).await;
         });
-        match ch_rx.recv().await.expect("should receive exit task id") {
-            ClientTask::WS => server_tun_task.abort(),
-            ClientTask::TUN => server_ws_task.abort(),
+        match ch_rx.recv().await.expect("should receive exit task id") {      
+            ExitEvent::WS => {
+                server_tun_task.abort();
+                ctrl_c_task.abort();
+            },
+            ExitEvent::TUN => {
+                server_ws_task.abort();
+                ctrl_c_task.abort();
+            },
+            ExitEvent::CTRLC => {
+                server_ws_task.abort();
+                server_tun_task.abort();
+            },
         }
     }
 
