@@ -1,9 +1,13 @@
-use crate::device::tun::TunSocket;
+use std::fmt::Debug;
 use std::future::Future;
 use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::task::Poll::{Pending, Ready};
 use std::task::{Context, Poll};
+
+use tokio::io::unix::AsyncFd;
+
+use crate::device::tun::TunSocket;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 #[path = "tun_darwin.rs"]
@@ -47,6 +51,38 @@ pub trait Tun: 'static + AsRawFd + Sized + Send + Sync {
     fn write4(&self, src: &[u8]) -> usize;
     fn write6(&self, src: &[u8]) -> usize;
     fn read<'a>(&self, dst: &'a mut [u8]) -> Result<usize, Error>;
+}
+
+pub struct AsyncTun {
+    pub inner: AsyncFd<TunSocket>,
+}
+
+impl AsyncTun {
+    pub fn new(tun: TunSocket) -> Self {
+        Self {
+            inner: AsyncFd::new(tun).expect("should create async tun success"),
+        }
+    }
+    pub async fn read(&self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let mut guard = self
+                .inner
+                .readable()
+                .await
+                .expect("should get readable success");
+            match guard.try_io(|inner| match inner.get_ref().read(out) {
+                Ok(usize) => Ok(usize),
+                Err(Error::IfaceRead(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("other err: {:?}", e),
+                )),
+            }) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
+        }
+    }
 }
 
 pub struct TunRead<'a> {

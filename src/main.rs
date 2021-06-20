@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use ws_tun::device::allowed_ips::AllowedIps;
 use ws_tun::device::tun::TunSocket;
-use ws_tun::device::{tun_read, Tun};
+use ws_tun::device::{AsyncTun, Tun};
 use ws_tun::logger;
 use ws_tun::utils::{next_ip_of, read_dst_ip, read_src_ip, AllowedIP, IfConfig};
 
@@ -35,7 +35,7 @@ struct ClientInfo {
 
 /// server handle client web socket connection
 async fn server_ws_to_tun(
-    tun: Arc<TunSocket>,
+    tun: Arc<AsyncTun>,
     mut read: SplitStream<WebSocketStream<TcpStream>>,
     client_ip: IpAddr,
     allowed_ips: AllowedIps<()>,
@@ -57,9 +57,9 @@ async fn server_ws_to_tun(
                         Ok(addr) if allowed_ips.find(addr).is_some() => {
                             debug!("got ws from {}", addr);
                             if addr.is_ipv4() {
-                                tun.write4(&bin);
+                                tun.inner.get_ref().write4(&bin);
                             } else {
-                                tun.write6(&bin);
+                                tun.inner.get_ref().write6(&bin);
                             }
                         }
                         Ok(addr) => warn!("server ws: drop source packet from {}", addr),
@@ -132,7 +132,7 @@ async fn server_tun_to_ws(
 /// the tun reader
 /// read the tun package and send to channel
 async fn tun_reader(
-    async_tun_read: Arc<TunSocket>,
+    async_tun_read: Arc<AsyncTun>,
     sender: Sender<Vec<u8>>,
     exit_token: CancellationToken,
 ) {
@@ -142,7 +142,7 @@ async fn tun_reader(
             _ = exit_token.cancelled() => {
                 break;
             }
-            res = tun_read(&async_tun_read, &mut buf) => {
+            res = async_tun_read.read(&mut buf) => {
                 match res {
                     Ok(len) => {
                         let msg = Vec::from(&buf[..len]);
@@ -267,15 +267,23 @@ async fn main() {
 
     let exit_token = CancellationToken::new();
 
-    let tun = Arc::new(
-        TunSocket::new(tun_name)
-            .expect("create tun success")
-            .set_non_blocking()
-            .expect("should set non blocked success"),
-    );
+    let raw_tun = TunSocket::new(tun_name)
+        .expect("create tun success")
+        .set_non_blocking()
+        .expect("should set non blocked success");
 
-    let tun_name = tun.name().expect("should get tun name success");
-    info!("name: {}, mtu: {}", tun_name, tun.mtu().unwrap());
+    let tun = Arc::new(AsyncTun::new(raw_tun));
+
+    let tun_name = tun
+        .inner
+        .get_ref()
+        .name()
+        .expect("should get tun name success");
+    info!(
+        "name: {}, mtu: {}",
+        tun_name,
+        tun.inner.get_ref().mtu().unwrap()
+    );
 
     let tasks = Arc::new(RwLock::new(Vec::new()));
 
@@ -351,9 +359,9 @@ async fn main() {
                                     Ok(addr) if allowed_ips.find(addr).is_some() => {
                                         debug!("client ws: got package from {}", addr);
                                         if addr.is_ipv4() {
-                                            tun.write4(&bin);
+                                            tun.inner.get_ref().write4(&bin);
                                         } else {
-                                            tun.write6(&bin);
+                                            tun.inner.get_ref().write6(&bin);
                                         }
                                     }
                                     Ok(addr) => warn!("client ws: drop source packet from {}", addr),
