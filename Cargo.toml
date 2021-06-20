@@ -19,3 +19,4 @@ openssl = { version = "0.10", features = ["vendored"] }
 futures-util = "0.3.13"
 #etherparse = "0.9.0"
 #url = "2.2.1"
+byteorder = "1.4.3"

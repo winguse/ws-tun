@@ -19,6 +19,7 @@ use tokio_tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use ws_tun::device::allowed_ips::AllowedIps;
 use ws_tun::device::tun::TunSocket;
 use ws_tun::device::{tun_read, Tun};
@@ -165,6 +166,14 @@ async fn tun_reader(
     }
 }
 
+/// return the micro seconds from unix epoch
+fn get_time() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("should get time success")
+        .as_micros()
+}
+
 #[tokio::main]
 async fn main() {
     log::set_logger(&logger::LOGGER).unwrap();
@@ -227,6 +236,15 @@ async fn main() {
                     .default_value("5")
                     .required(false),
             )
+            .arg(
+                Arg::with_name("hart-beat")
+                    .short("h")
+                    .long("hard-beat")
+                    .value_name("HEART_BEAT")
+                    .help("the interval of seconds between sending ping/pong when there is no message, only implemented in client as for now.")
+                    .default_value("25")
+                    .required(false),
+            )
             .get_matches()
     };
 
@@ -243,6 +261,8 @@ async fn main() {
         .expect("should be a valid number of max-client config");
     let close_timeout = value_t!(matches.value_of("close-timeout"), u64)
         .expect("should be a valid number of close-timeout");
+    let heart_beat = value_t!(matches.value_of("hart-beat"), u64)
+        .expect("should be a valid number of hart-beat");
     let is_client_mode = server_url.starts_with("ws");
 
     #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -296,7 +316,8 @@ async fn main() {
             .await
             .expect("should connect to server success");
         info!("client connected");
-        let (mut write, mut read) = ws_stream.split();
+        let (write, mut read) = ws_stream.split();
+        let wrapped_write = Arc::new(Mutex::new(write));
         match read.next().await {
             Some(Ok(Message::Text(init))) => {
                 info!("server config: {}", init);
@@ -313,6 +334,7 @@ async fn main() {
 
         {
             // create client task for reading web socket
+            let ws_write = wrapped_write.clone();
             let client_ws_exit = exit_token.clone();
             tasks.write().await.push(spawn(async move {
                 let mut allowed_ips: AllowedIps<()> = Default::default();
@@ -344,8 +366,15 @@ async fn main() {
                                     Ok(addr) => warn!("client ws: drop source packet from {}", addr),
                                     Err(_) => break,
                                 },
-                                Some(Ok(Message::Ping(_bin))) => {}
-                                Some(Ok(Message::Pong(_bin))) => {}
+                                Some(Ok(Message::Ping(bin))) => {
+                                    let _ = ws_write.lock().await.send(Message::Pong(bin)).await;
+                                }
+                                Some(Ok(Message::Pong(bin))) => {
+                                    if bin.len() == 16 {
+                                        let dt = get_time() - bin.as_slice().read_u128::<BigEndian>().expect("");
+                                        info!("received pong, latency: {} micro seconds", dt);
+                                    }
+                                }
                                 Some(Ok(Message::Close(_))) => break,
                                 Some(Err(_)) => break,
                             }
@@ -369,13 +398,19 @@ async fn main() {
                             info!("client tun reader exit because of canceled");
                             break;
                         },
+                        _ = sleep(Duration::from_secs(heart_beat)) => {
+                            debug!("sending hart beat");
+                            let mut wtr = Vec::new();
+                            wtr.write_u128::<BigEndian>(get_time()).expect("write ts success");
+                            let _ = wrapped_write.lock().await.send(Message::Ping(wtr)).await;
+                        },
                         res = tun_read_rx.recv() => {
                             match res {
                                 None => {
                                     error!("client tun: receive nothing");
                                     break;
                                 }
-                                Some(bin) => match write.send(Message::Binary(Vec::from(bin))).await {
+                                Some(bin) => match wrapped_write.lock().await.send(Message::Binary(Vec::from(bin))).await {
                                     Ok(_) => debug!("client tun: send to ws"),
                                     Err(_) => break,
                                 },
