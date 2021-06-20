@@ -40,14 +40,13 @@ async fn server_ws_to_tun(
     client_ip: IpAddr,
     allowed_ips: AllowedIps<()>,
     route_table: Arc<RwLock<HashMap<IpAddr, ClientInfo>>>,
-    ws_write: Arc<Mutex<SplitSink<WebSocketStream<TcpStream>, Message>>>,
     exit_token: CancellationToken,
 ) {
     loop {
         debug!("server ws: wait for packet");
         select! {
             _ = exit_token.cancelled() => {
-                info!("server tun exit because receive cancel");
+                info!("server ws -> tun exit because receive cancel");
                 break;
             }
             res = read.next() => {
@@ -66,12 +65,7 @@ async fn server_ws_to_tun(
                         Ok(addr) => warn!("server ws: drop source packet from {}", addr),
                         Err(_) => break,
                     },
-                    Some(Ok(Message::Ping(bin))) => {
-                        match ws_write.lock().await.send(Message::Pong(bin)).await {
-                            Ok(_) => {}
-                            Err(e) => error!("Error found when sending Pong: {}", e),
-                        }
-                    }
+                    Some(Ok(Message::Ping(_bin))) => { /* the lib already handled response */ }
                     Some(Ok(Message::Pong(_bin))) => {}
                     Some(Ok(Message::Close(_))) => break,
                     Some(Err(_)) => break,
@@ -95,7 +89,7 @@ async fn server_tun_to_ws(
         debug!("server tun: wait for packet");
         select! {
             _ = exit_token.cancelled() => {
-                info!("server tun exit because receive cancel");
+                info!("server tun -> ws exit because receive cancel");
                 break;
             }
             res = tun_read_rx.recv() => {
@@ -334,7 +328,6 @@ async fn main() {
 
         {
             // create client task for reading web socket
-            let ws_write = wrapped_write.clone();
             let client_ws_exit = exit_token.clone();
             tasks.write().await.push(spawn(async move {
                 let mut allowed_ips: AllowedIps<()> = Default::default();
@@ -366,9 +359,7 @@ async fn main() {
                                     Ok(addr) => warn!("client ws: drop source packet from {}", addr),
                                     Err(_) => break,
                                 },
-                                Some(Ok(Message::Ping(bin))) => {
-                                    let _ = ws_write.lock().await.send(Message::Pong(bin)).await;
-                                }
+                                Some(Ok(Message::Ping(_bin))) => { /* no need to do, the lib will return pong */ }
                                 Some(Ok(Message::Pong(bin))) => {
                                     if bin.len() == 16 {
                                         let dt = get_time() - bin.as_slice().read_u128::<BigEndian>().expect("");
@@ -464,7 +455,7 @@ async fn main() {
                 loop {
                     select! {
                         _ = server_ws_exit_token.cancelled() => {
-                            info!("server tun exit because receive cancel");
+                            info!("server ws main loop exit because receive cancel");
                             break;
                         }
                         res = listener.accept() => {
@@ -500,7 +491,7 @@ async fn main() {
 
                             info!("generating ip for the client");
 
-                            let (new_ip, current_ws_write) = {
+                            let new_ip = {
                                 let mut writable_table = route_table.write().await;
                                 if writable_table.len() > max_client {
                                     warn!(
@@ -543,7 +534,7 @@ async fn main() {
                                         ws_write: current_ws_write.clone(),
                                     },
                                 );
-                                (new_ip, current_ws_write)
+                                new_ip
                             };
                             let new_ip_length = if new_ip.is_ipv4() { 32 } else { 128 };
 
@@ -559,7 +550,6 @@ async fn main() {
                                         new_ip,
                                         allowed_ips,
                                         route_table.clone(),
-                                        current_ws_write,
                                         server_ws_exit_token.clone(),
                                     ))
                                 );
