@@ -526,7 +526,7 @@ async fn main() {
                                 let if_config = IfConfig {
                                     mtu,
                                     addresses: vec![net_addr],
-                                    routes: vec![net_addr],
+                                    routes: vec![],
                                 };
                                 match ws_write.send(Message::Text(if_config.to_string())).await {
                                     Ok(_) => {}

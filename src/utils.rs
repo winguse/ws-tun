@@ -385,7 +385,7 @@ impl IfConfig {
             .expect("failed to start the tunnel");
         for route in &self.routes {
             Command::new("ip")
-                .args(&["route", "add", &route.to_string(), "dev", &tun_name])
+                .args(&["route", "add", &route.to_string(), "dev", &tun_name]) // TODO fix route prefix
                 .status()
                 .await
                 .expect("failed to add route");
