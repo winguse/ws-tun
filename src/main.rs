@@ -113,7 +113,9 @@ async fn server_tun_to_ws(
                                         Err(e) => error!("error while sending data to {}: {}", ip, e),
                                     }
                                 }
-                                None => info!("destination {} is not found, dropped", ip),
+                                None => {
+                                    info!("from {} to destination {} is not found, dropped", read_src_ip(&bin).expect("should read ip success"), ip)
+                                },
                             },
                             Err(msg) => {
                                 error!("failed to parse ip from received packet: {}", msg);
@@ -364,7 +366,7 @@ async fn main() {
                                             tun.inner.get_ref().write6(&bin);
                                         }
                                     }
-                                    Ok(addr) => warn!("client ws: drop source packet from {}", addr),
+                                    Ok(addr) => warn!("client ws: drop source packet from {} to {}", addr, read_dst_ip(&bin).expect("read dest success")),
                                     Err(_) => break,
                                 },
                                 Some(Ok(Message::Ping(_bin))) => { /* no need to do, the lib will return pong */ }
