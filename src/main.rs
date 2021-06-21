@@ -412,7 +412,7 @@ async fn main() {
                                     break;
                                 }
                                 Some(bin) => {
-                                    info!("client tun -> ws, {} -> {}", read_src_ip(&bin).unwrap(), read_dst_ip(&bin).unwrap());
+                                    debug!("client tun -> ws, {} -> {}", read_src_ip(&bin).unwrap(), read_dst_ip(&bin).unwrap());
                                     match wrapped_write.lock().await.send(Message::Binary(Vec::from(bin))).await {
                                         Ok(_) => {},
                                         Err(_) => break,
